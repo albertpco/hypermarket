@@ -48,6 +48,14 @@ pub enum MarketError {
     CollateralTransferFailed,
     #[error("Withdrawal amount exceeds available balance")]
     WithdrawalExceedsBalance,
+    #[error("Order placement failed")]
+    OrderPlacementFailed,
+    #[error("Order cancellation failed")]
+    OrderCancellationFailed,
+    #[error("Market settlement failed")]
+    MarketSettlementFailed,
+    #[error("Invalid signature")]
+    InvalidSignature,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -61,6 +69,7 @@ pub struct MarketContractState {
     pub total_collateral: U256, // Total collateral in the market
     auth_manager: Arc<AuthManager>,
     event_emitter: Arc<dyn EventEmitter>,
+    client: HyperliquidClient,
 }
 
 impl MarketContractState {
@@ -73,7 +82,9 @@ impl MarketContractState {
         let api = HyperliquidApi::new(api_url)
             .map_err(MarketError::HyperliquidError)?;
 
-        Ok(Self {
+        let client = HyperliquidClient::new(api.clone(), auth_manager.clone());
+
+        let mut market_contract = Self {
             market,
             api,
             yes_token_supply: U256::zero(),
@@ -83,11 +94,26 @@ impl MarketContractState {
             total_collateral: U256::zero(),
             auth_manager,
             event_emitter,
-        })
+            client,
+        };
+
+        // Spawn a background task to check market expiry
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = market_contract.check_expiry().await {
+                    eprintln!("Error checking market expiry: {}", e);
+                }
+            }
+        });
+
+        Ok(market_contract)
     }
 
     async fn get_order_book(&self) -> Result<L2Book, MarketError> {
-        self.api
+        // Fetch order book from Hyperliquid API
+        self.client
             .get_l2_book(&self.market.yes_token_address)
             .await
             .map_err(MarketError::HyperliquidError)
@@ -128,12 +154,8 @@ impl MarketContractState {
         let signed_request = self.create_signed_request("deposit_collateral").await?;
 
         // Process deposit on Hyperliquid
-        self.api
-            .deposit_collateral_with_auth(
-                &signed_request,
-                &self.market.collateral_token,
-                amount,
-            )
+        let tx_hash = self.client
+            .deposit_collateral(&self.market.collateral_token, amount)
             .await
             .map_err(|e| {
                 if e.to_string().contains("transfer") {
@@ -156,6 +178,7 @@ impl MarketContractState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            tx_hash,
         });
 
         Ok(())
@@ -184,15 +207,9 @@ impl MarketContractState {
             return Err(MarketError::InsufficientCollateral);
         }
 
-        let signed_request = self.create_signed_request("withdraw_collateral").await?;
-
         // Process withdrawal on Hyperliquid
-        self.api
-            .withdraw_collateral_with_auth(
-                &signed_request,
-                &self.market.collateral_token,
-                amount,
-            )
+        let tx_hash = self.client
+            .withdraw_collateral(&self.market.collateral_token, amount)
             .await
             .map_err(MarketError::HyperliquidError)?;
 
@@ -209,6 +226,7 @@ impl MarketContractState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            tx_hash,
         });
 
         Ok(())
@@ -347,8 +365,6 @@ impl MarketContractState {
             return Err(MarketError::InsufficientCollateral);
         }
 
-        let signed_request = self.create_signed_request("place_order").await?;
-
         // Get current order book to check liquidity
         let order_book = self.get_order_book().await?;
         
@@ -376,10 +392,12 @@ impl MarketContractState {
         };
 
         // Submit order to Hyperliquid
-        self.api
-            .place_order_with_auth(&signed_request, order)
+        let tx_hash = self.client
+            .place_order(order)
             .await
-            .map_err(MarketError::HyperliquidError)?;
+            .map_err(|e| {
+                MarketError::OrderPlacementFailed
+            })?;
 
         // Lock additional collateral
         *self.collateral_balances.get_mut(&user_address).unwrap() -= required_collateral;
@@ -395,6 +413,7 @@ impl MarketContractState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            tx_hash,
         });
 
         Ok(())
@@ -426,6 +445,310 @@ impl MarketContractState {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    pub async fn mint_tokens(&mut self, amount: U256) -> Result<(), MarketError> {
+        if self.market.status != MarketStatus::Active {
+            return Err(MarketError::MarketNotActive);
+        }
+
+        let user_address = self.get_caller_address().await?;
+
+        // Update token supply
+        self.yes_token_supply += amount;
+        self.no_token_supply += amount;
+
+        // Update user balances
+        let user_balance = self.user_balances
+            .entry(user_address)
+            .or_insert((U256::zero(), U256::zero()));
+        user_balance.0 += amount; // yes tokens
+        user_balance.1 += amount; // no tokens
+
+        // Emit event
+        self.event_emitter.emit_market_event(MarketEvent::TokensMinted {
+            market_id: self.market.yes_token_address.clone(),
+            user: user_address,
+            amount,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        });
+
+        Ok(())
+    }
+
+    pub async fn burn_tokens(&mut self, yes_amount: U256, no_amount: U256) -> Result<(), MarketError> {
+        if self.market.status != MarketStatus::Active {
+            return Err(MarketError::MarketNotActive);
+        }
+
+        let user_address = self.get_caller_address().await?;
+        let balance = self.user_balances
+            .get(&user_address)
+            .ok_or(MarketError::InsufficientBalance)?;
+
+        // Check if user has sufficient balance
+        if balance.0 < yes_amount || balance.1 < no_amount {
+            return Err(MarketError::InsufficientBalance);
+        }
+
+        let signed_request = self.create_signed_request("burn_tokens").await?;
+
+        // Process burn transaction on Hyperliquid
+        let tx_hash = self.client
+            .burn_tokens_with_auth(&signed_request, &self.market.yes_token_address, yes_amount, no_amount)
+            .await
+            .map_err(MarketError::HyperliquidError)?;
+
+        // Update token supply
+        self.yes_token_supply -= yes_amount;
+        self.no_token_supply -= no_amount;
+
+        // Update user balances
+        let user_balance = self.user_balances.get_mut(&user_address).unwrap();
+        user_balance.0 -= yes_amount;
+        user_balance.1 -= no_amount;
+
+        // Emit event
+        self.event_emitter.emit_market_event(MarketEvent::TokensBurned {
+            market_id: self.market.yes_token_address.clone(),
+            user: user_address,
+            yes_amount,
+            no_amount,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            tx_hash,
+        });
+
+        Ok(())
+    }
+
+    pub async fn resolve(&mut self) -> Result<(), MarketError> {
+        if self.market.status != MarketStatus::Expired {
+            return Err(MarketError::MarketNotExpired);
+        }
+
+        let user_address = self.get_caller_address().await?;
+        
+        // Verify caller is the designated oracle
+        if format!("{:?}", user_address) != self.market.oracle_id {
+            return Err(MarketError::InvalidOracle);
+        }
+
+        if self.market.resolved_outcome.is_some() {
+            return Err(MarketError::MarketAlreadyResolved);
+        }
+
+        // Fetch outcome from OracleManager
+        let outcome = self.get_oracle_outcome().await?;
+
+        // Cancel all open orders
+        let tx_hash = self.client
+            .cancel_all_orders(&self.market.yes_token_address)
+            .await
+            .map_err(MarketError::HyperliquidError)?;
+
+        // Update market status
+        self.set_market_status(MarketStatus::Resolved);
+        self.market.resolved_outcome = Some(outcome);
+
+        // Emit event
+        self.event_emitter.emit_market_event(MarketEvent::MarketResolved {
+            market_id: self.market.yes_token_address.clone(),
+            oracle: user_address,
+            outcome,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            tx_hash,
+        });
+
+        Ok(())
+    }
+
+    async fn get_oracle_outcome(&self) -> Result<bool, MarketError> {
+        // Get outcome from OracleManager
+        let oracle_manager = self.get_oracle_manager().await?;
+        oracle_manager
+            .get_outcome(self.market.yes_token_address.clone())
+            .ok_or(MarketError::MarketNotResolved)
+    }
+
+    async fn get_oracle_manager(&self) -> Result<Arc<dyn OracleManager>, MarketError> {
+        // Get OracleManager from context
+        // This is a placeholder, in a real application, you would need to get the OracleManager from a context or dependency injection
+        // For now, we will create a new OracleManager
+        let auth_manager = self.auth_manager.clone();
+        let event_emitter = self.event_emitter.clone();
+        let oracle_manager = OracleManagerState::new(auth_manager, event_emitter);
+        Ok(Arc::new(oracle_manager))
+    }
+
+    fn set_market_status(&mut self, status: MarketStatus) {
+        self.market.status = status;
+    }
+
+    pub async fn claim_winnings(&mut self) -> Result<U256, MarketError> {
+        if self.market.status != MarketStatus::Resolved {
+            return Err(MarketError::MarketNotResolved);
+        }
+
+        let user_address = self.get_caller_address().await?;
+        let balance = self.user_balances
+            .get(&user_address)
+            .ok_or(MarketError::InsufficientBalance)?;
+
+        let outcome = self.market.resolved_outcome.unwrap();
+        let winning_token_address = if outcome {
+            &self.market.yes_token_address
+        } else {
+            &self.market.no_token_address
+        };
+
+        let winning_amount = if outcome {
+            balance.0 // YES tokens
+        } else {
+            balance.1 // NO tokens
+        };
+
+        if winning_amount == U256::zero() {
+            return Err(MarketError::InsufficientBalance);
+        }
+
+        // Get user's position from Hyperliquid
+        let position = self.get_user_position(user_address).await?;
+        
+        // Cancel any remaining open orders
+        let tx_hash = self.client
+            .cancel_all_orders(winning_token_address)
+            .await
+            .map_err(MarketError::HyperliquidError)?;
+
+        // Calculate settlement price based on outcome
+        let settlement_price = if outcome {
+            U256::from(1) // YES tokens worth 1 collateral token
+        } else {
+            U256::from(0) // YES tokens worth 0 collateral token
+        };
+
+        // Process settlement on Hyperliquid
+        let tx_hash = self.client
+            .settle_market(winning_token_address, winning_amount)
+            .await
+            .map_err(|_| MarketError::MarketSettlementFailed)?;
+
+        // Calculate collateral to return
+        let collateral_to_return = winning_amount * settlement_price;
+        
+        // Update collateral balance
+        if collateral_to_return > U256::zero() {
+            *self.collateral_balances.entry(user_address).or_insert(U256::zero()) += collateral_to_return;
+        }
+
+        // Clear user's token balance
+        self.user_balances.remove(&user_address);
+
+        // Update total supply
+        self.yes_token_supply -= balance.0;
+        self.no_token_supply -= balance.1;
+
+        // Emit event
+        self.event_emitter.emit_market_event(MarketEvent::WinningsClaimed {
+            market_id: self.market.yes_token_address.clone(),
+            user: user_address,
+            amount: winning_amount,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            tx_hash,
+        });
+
+        Ok(winning_amount)
+    }
+
+    pub async fn cancel_order(&mut self, order_id: String) -> Result<(), MarketError> {
+        if self.market.status != MarketStatus::Active {
+            return Err(MarketError::MarketNotActive);
+        }
+
+        let user_address = self.get_caller_address().await?;
+
+        // Cancel order on Hyperliquid
+        // Note: Hyperliquid API does not support cancelling a single order by ID
+        // We will cancel all orders for now
+        let tx_hash = self.client
+            .cancel_all_orders(&self.market.yes_token_address)
+            .await
+            .map_err(|_| MarketError::OrderCancellationFailed)?;
+
+        // Emit event
+        self.event_emitter.emit_market_event(MarketEvent::OrderCancelled {
+            market_id: self.market.yes_token_address.clone(),
+            user: user_address,
+            order_id,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            tx_hash,
+        });
+
+        Ok(())
+    }
+
+    pub async fn cancel_all_user_orders(&mut self) -> Result<(), MarketError> {
+        if self.market.status != MarketStatus::Active {
+            return Err(MarketError::MarketNotActive);
+        }
+
+        let user_address = self.get_caller_address().await?;
+
+        // Cancel all user orders on Hyperliquid
+        self.client
+            .cancel_all_orders(&self.market.yes_token_address)
+            .await
+            .map_err(MarketError::HyperliquidError)?;
+
+        // Emit event
+        self.event_emitter.emit_market_event(MarketEvent::OrdersCancelled {
+            market_id: self.market.yes_token_address.clone(),
+            user: user_address,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        });
+
+        Ok(())
+    }
+
+    pub async fn check_expiry(&mut self) -> Result<(), MarketError> {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if current_time >= self.market.expiry_timestamp && self.market.status == MarketStatus::Active {
+            self.set_market_status(MarketStatus::Expired);
+
+            // Emit event
+            let user_address = self.get_caller_address().await?;
+            self.event_emitter.emit_market_event(MarketEvent::MarketExpired {
+                market_id: self.market.yes_token_address.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            });
         }
 
         Ok(())
@@ -538,7 +861,7 @@ impl MarketContract for MarketContractState {
         Ok(())
     }
 
-    async fn resolve(&mut self, outcome: bool) -> Result<(), MarketError> {
+    async fn resolve(&mut self) -> Result<(), MarketError> {
         if self.market.status != MarketStatus::Expired {
             return Err(MarketError::MarketNotExpired);
         }
@@ -554,16 +877,17 @@ impl MarketContract for MarketContractState {
             return Err(MarketError::MarketAlreadyResolved);
         }
 
-        let signed_request = self.create_signed_request("resolve_market").await?;
+        // Fetch outcome from OracleManager
+        let outcome = self.get_oracle_outcome().await?;
 
         // Cancel all open orders
-        self.api
-            .cancel_all_orders_with_auth(&signed_request, &self.market.yes_token_address)
+        let tx_hash = self.client
+            .cancel_all_orders(&self.market.yes_token_address)
             .await
             .map_err(MarketError::HyperliquidError)?;
 
         // Update market status
-        self.market.status = MarketStatus::Resolved;
+        self.set_market_status(MarketStatus::Resolved);
         self.market.resolved_outcome = Some(outcome);
 
         // Emit event
@@ -575,6 +899,7 @@ impl MarketContract for MarketContractState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            tx_hash,
         });
 
         Ok(())
@@ -607,14 +932,12 @@ impl MarketContract for MarketContractState {
             return Err(MarketError::InsufficientBalance);
         }
 
-        let signed_request = self.create_signed_request("claim_winnings").await?;
-
         // Get user's position from Hyperliquid
         let position = self.get_user_position(user_address).await?;
         
         // Cancel any remaining open orders
-        self.api
-            .cancel_all_orders_with_auth(&signed_request, winning_token_address)
+        let tx_hash = self.client
+            .cancel_all_orders(winning_token_address)
             .await
             .map_err(MarketError::HyperliquidError)?;
 
@@ -626,14 +949,10 @@ impl MarketContract for MarketContractState {
         };
 
         // Process settlement on Hyperliquid
-        self.api
-            .settle_market_with_auth(
-                &signed_request,
-                winning_token_address,
-                winning_amount,
-            )
+        let tx_hash = self.client
+            .settle_market(winning_token_address, winning_amount)
             .await
-            .map_err(MarketError::HyperliquidError)?;
+            .map_err(|_| MarketError::MarketSettlementFailed)?;
 
         // Calculate collateral to return
         let collateral_to_return = winning_amount * settlement_price;
@@ -659,6 +978,7 @@ impl MarketContract for MarketContractState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            tx_hash,
         });
 
         Ok(winning_amount)
@@ -682,24 +1002,19 @@ impl MarketContract for MarketContractState {
         let signed_request = self.create_signed_request("burn_tokens").await?;
 
         // Process burn transaction on Hyperliquid
-        self.api
-            .burn_tokens_with_auth(
-                &signed_request,
-                &self.market.yes_token_address,
-                &self.market.no_token_address,
-                yes_amount,
-                no_amount,
-            )
+        let tx_hash = self.client
+            .burn_tokens_with_auth(&signed_request, &self.market.yes_token_address, yes_amount, no_amount)
             .await
             .map_err(MarketError::HyperliquidError)?;
 
-        // Update local state
+        // Update token supply
         self.yes_token_supply -= yes_amount;
         self.no_token_supply -= no_amount;
 
-        let balance = self.user_balances.get_mut(&user_address).unwrap();
-        balance.0 -= yes_amount;
-        balance.1 -= no_amount;
+        // Update user balances
+        let user_balance = self.user_balances.get_mut(&user_address).unwrap();
+        user_balance.0 -= yes_amount;
+        user_balance.1 -= no_amount;
 
         // Emit event
         self.event_emitter.emit_market_event(MarketEvent::TokensBurned {
@@ -711,6 +1026,7 @@ impl MarketContract for MarketContractState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            tx_hash,
         });
 
         Ok(())
@@ -773,6 +1089,10 @@ mod tests {
         let (mut market_contract, _) = setup_test_market().await;
         let result = market_contract.mint_tokens(U256::from(100)).await;
         assert!(result.is_ok());
+        assert_eq!(market_contract.yes_token_supply, U256::from(100));
+        assert_eq!(market_contract.no_token_supply, U256::from(100));
+        let user_address = market_contract.get_caller_address().await.unwrap();
+        assert_eq!(market_contract.user_balances.get(&user_address).unwrap(), &(U256::from(100), U256::from(100)));
     }
 
     #[tokio::test]
@@ -797,7 +1117,7 @@ mod tests {
         market_contract.market.status = MarketStatus::Expired;
 
         // Resolve market
-        let result = market_contract.resolve(true).await;
+        let result = market_contract.resolve().await;
         assert!(result.is_ok());
         assert_eq!(market_contract.market.status, MarketStatus::Resolved);
         assert_eq!(market_contract.market.resolved_outcome, Some(true));
@@ -807,10 +1127,10 @@ mod tests {
     async fn test_burn_tokens() {
         let (mut market_contract, _) = setup_test_market().await;
         
-        // First mint some tokens
+        // Mint some tokens
         market_contract.mint_tokens(U256::from(100)).await.unwrap();
 
-        // Then burn some tokens
+        // Burn some tokens
         let result = market_contract
             .burn_tokens(U256::from(30), U256::from(40))
             .await;
@@ -875,7 +1195,7 @@ mod tests {
         let (mut market_contract, _) = setup_test_market().await;
         
         // Try to resolve market before it's expired
-        let result = market_contract.resolve(true).await;
+        let result = market_contract.resolve().await;
         assert!(matches!(result, Err(MarketError::MarketNotExpired)));
     }
 
@@ -890,7 +1210,7 @@ mod tests {
         market_contract.market.oracle_id = "different_oracle".to_string();
 
         // Try to resolve market with non-oracle address
-        let result = market_contract.resolve(true).await;
+        let result = market_contract.resolve().await;
         assert!(matches!(result, Err(MarketError::InvalidOracle)));
     }
 
@@ -903,11 +1223,15 @@ mod tests {
         let caller = market_contract.get_caller_address().await.unwrap();
         market_contract.market.oracle_id = format!("{:?}", caller);
 
+        // Submit outcome to oracle
+        let oracle_manager = market_contract.get_oracle_manager().await.unwrap();
+        oracle_manager.submit_outcome(market_contract.market.yes_token_address.clone(), true).await.unwrap();
+
         // Resolve market first time
-        market_contract.resolve(true).await.unwrap();
+        market_contract.resolve().await.unwrap();
 
         // Try to resolve again
-        let result = market_contract.resolve(false).await;
+        let result = market_contract.resolve().await;
         assert!(matches!(result, Err(MarketError::MarketAlreadyResolved)));
     }
 
@@ -986,5 +1310,130 @@ mod tests {
         // Try to withdraw collateral
         let result = market_contract.withdraw_collateral(U256::from(1000)).await;
         assert!(matches!(result, Err(MarketError::MarketNotActive)));
+    }
+
+    #[tokio::test]
+    async fn test_claim_winnings() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Mint some tokens
+        market_contract.mint_tokens(U256::from(100)).await.unwrap();
+
+        // Set market to expired and resolved
+        market_contract.market.status = MarketStatus::Expired;
+        let caller = market_contract.get_caller_address().await.unwrap();
+        market_contract.market.oracle_id = format!("{:?}", caller);
+
+        // Submit outcome to oracle
+        let oracle_manager = market_contract.get_oracle_manager().await.unwrap();
+        oracle_manager.submit_outcome(market_contract.market.yes_token_address.clone(), true).await.unwrap();
+
+        // Resolve market
+        market_contract.resolve().await.unwrap();
+
+        // Claim winnings
+        let result = market_contract.claim_winnings().await;
+        assert!(result.is_ok());
+
+        // Verify user balance is cleared
+        let user_address = market_contract.get_caller_address().await.unwrap();
+        assert!(market_contract.user_balances.get(&user_address).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_claim_winnings_not_resolved() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Try to claim winnings before market is resolved
+        let result = market_contract.claim_winnings().await;
+        assert!(matches!(result, Err(MarketError::MarketNotResolved)));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_not_expired() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Try to resolve market before it's expired
+        let result = market_contract.resolve().await;
+        assert!(matches!(result, Err(MarketError::MarketNotExpired)));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_invalid_oracle() {
+        let (mut market_contract, wallet) = setup_test_market().await;
+        
+        // Set market to expired status
+        market_contract.market.status = MarketStatus::Expired;
+
+        // Set a different oracle ID than the caller's address
+        market_contract.market.oracle_id = "different_oracle".to_string();
+
+        // Try to resolve market with non-oracle address
+        let result = market_contract.resolve().await;
+        assert!(matches!(result, Err(MarketError::InvalidOracle)));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_already_resolved() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Set market to expired and set oracle ID to match caller
+        market_contract.market.status = MarketStatus::Expired;
+        let caller = market_contract.get_caller_address().await.unwrap();
+        market_contract.market.oracle_id = format!("{:?}", caller);
+
+        // Submit outcome to oracle
+        let oracle_manager = market_contract.get_oracle_manager().await.unwrap();
+        oracle_manager.submit_outcome(market_contract.market.yes_token_address.clone(), true).await.unwrap();
+
+        // Resolve market first time
+        market_contract.resolve().await.unwrap();
+
+        // Try to resolve again
+        let result = market_contract.resolve().await;
+        assert!(matches!(result, Err(MarketError::MarketAlreadyResolved)));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Mint some tokens and place an order
+        market_contract.mint_tokens(U256::from(100)).await.unwrap();
+        market_contract.place_order(Side::Buy, U256::from(50), U256::from(10)).await.unwrap();
+
+        // Cancel the order
+        let result = market_contract.cancel_order("test_order_id".to_string()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_user_orders() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Mint some tokens and place an order
+        market_contract.mint_tokens(U256::from(100)).await.unwrap();
+        market_contract.place_order(Side::Buy, U256::from(50), U256::from(10)).await.unwrap();
+
+        // Cancel all user orders
+        let result = market_contract.cancel_all_user_orders().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_expiry() {
+        let (mut market_contract, _) = setup_test_market().await;
+        
+        // Set market to expire in 1 second
+        market_contract.market.expiry_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() + 1;
+
+        // Wait for 3 seconds to allow background task to run
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // Check expiry
+        assert_eq!(market_contract.market.status, MarketStatus::Expired);
     }
 } 
