@@ -1,55 +1,23 @@
-use serde::{Deserialize, Serialize};
-
-// Market types and structures
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Market {
-    pub question: String,
-    pub expiry_timestamp: u64,
-    pub oracle_id: String,
-    pub collateral_token: String,
-    pub status: MarketStatus,
-    pub yes_token_address: String,
-    pub no_token_address: String,
-    pub resolved_outcome: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum MarketStatus {
-    Active,
-    Expired,
-    Resolved,
-}
-
-// Market Factory contract interface
-pub trait MarketFactory {
-    fn create_market(
-        &mut self,
-        question: String,
-        expiry_timestamp: u64,
-        oracle_id: String,
-        collateral_token: String,
-    ) -> Result<String, String>;
-
-    fn get_market(&self, market_id: String) -> Option<Market>;
-    fn list_markets(&self) -> Vec<(String, Market)>;
-}
-
-// Market contract interface
-pub trait MarketContract {
-    fn mint_tokens(&mut self, amount: u64) -> Result<(), String>;
-    fn burn_tokens(&mut self, yes_amount: u64, no_amount: u64) -> Result<(), String>;
-    fn resolve(&mut self, outcome: bool) -> Result<(), String>;
-    fn claim_winnings(&mut self) -> Result<u64, String>;
-}
-
-// Oracle Manager interface
-pub trait OracleManager {
-    fn register_oracle(&mut self, oracle_id: String) -> Result<(), String>;
-    fn submit_outcome(&mut self, market_id: String, outcome: bool) -> Result<(), String>;
-    fn get_outcome(&self, market_id: String) -> Option<bool>;
-}
-
-// Implementation modules will be added in separate files
-pub mod market_factory;
+pub mod auth;
+pub mod events;
+pub mod hyperliquid_client;
 pub mod market;
-pub mod oracle; 
+pub mod market_factory;
+pub mod oracle;
+
+pub use auth::{AuthError, AuthManager};
+pub use events::{EventEmitter, EventLogger, MarketEvent, OracleEvent};
+pub use hyperliquid_client::HyperliquidClient;
+pub use market::{Market, MarketError, MarketStatus};
+pub use market_factory::{MarketFactory, MarketFactoryError, MarketFactoryEvent, MarketFactoryState};
+pub use oracle::{OracleError, OracleManager, OracleManagerState};
+
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait MarketContract {
+    async fn mint_tokens(&mut self, amount: u64) -> Result<(), MarketError>;
+    async fn burn_tokens(&mut self, yes_amount: u64, no_amount: u64) -> Result<(), MarketError>;
+    async fn resolve(&mut self, outcome: bool) -> Result<(), MarketError>;
+    async fn claim_winnings(&mut self) -> Result<u64, MarketError>;
+} 

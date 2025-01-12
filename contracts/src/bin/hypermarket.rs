@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand};
 use hypermarket::{
-    market::{MarketContractState, MarketError},
-    market_factory::{MarketFactoryState, MarketFactoryError},
+    market::{MarketContractState},
+    market_factory::{MarketFactoryState},
     auth::AuthManager,
     events::EventLogger,
+    MarketContract,
+    MarketFactory,
 };
 use ethers::types::{Address, U256};
-use hyperliquid_rust::types::order::Side;
 use std::sync::Arc;
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -80,7 +82,17 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    env_logger::init();
+
+    // Load .env file if it exists
+    dotenv::dotenv().ok();
+
     let cli = Cli::parse();
+
+    // Log configuration (but mask private key)
+    log::info!("Using API URL: {}", cli.api_url);
+    log::info!("Private key is set: {}", !cli.private_key.is_empty());
 
     // Setup components
     let auth_manager = Arc::new(AuthManager::new(&cli.api_url).await?);
@@ -91,11 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut factory = MarketFactoryState::new(
         &cli.api_url,
         auth_manager.clone(),
+        event_logger.clone(),
+        U256::from(100),
     ).await?;
 
     match cli.command {
         Commands::CreateMarket { question, expiry, oracle, collateral } => {
-            let oracle_addr = oracle.parse::<Address>()?;
+            let oracle_addr = Address::from_str(&oracle)?;
             let market_id = factory.create_market(
                 question,
                 expiry,
@@ -122,12 +136,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let mut market_contract = MarketContractState::new(
                 market,
-                &cli.api_url,
                 auth_manager.clone(),
                 event_logger.clone(),
-            ).await?;
+                Default::default(),
+            );
 
-            market_contract.deposit_collateral(U256::from(amount)).await?;
+            market_contract.mint_tokens(amount).await?;
             println!("Deposited {} USDC as collateral", amount);
         }
 
@@ -137,39 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let mut market_contract = MarketContractState::new(
                 market,
-                &cli.api_url,
                 auth_manager.clone(),
                 event_logger.clone(),
-            ).await?;
+                Default::default(),
+            );
 
-            market_contract.mint_tokens(U256::from(amount)).await?;
+            market_contract.mint_tokens(amount).await?;
             println!("Minted {} YES/NO tokens", amount);
         }
 
-        Commands::PlaceOrder { market_id, side, price, amount } => {
+        Commands::PlaceOrder { market_id, side: _, price: _, amount: _ } => {
             let market = factory.get_market(market_id.clone())
                 .ok_or("Market not found")?;
             
-            let mut market_contract = MarketContractState::new(
-                market,
-                &cli.api_url,
-                auth_manager.clone(),
-                event_logger.clone(),
-            ).await?;
-
-            let side = match side.to_lowercase().as_str() {
-                "buy" => Side::Buy,
-                "sell" => Side::Sell,
-                _ => return Err("Invalid side. Use 'buy' or 'sell'".into()),
-            };
-
-            market_contract.place_order(
-                side,
-                U256::from(price),
-                U256::from(amount),
-            ).await?;
-            println!("Placed order: {} {} tokens at ${}.{:02}", 
-                side, amount, price / 100, price % 100);
+            println!("Order placement not yet implemented for market: {}", market.question);
         }
 
         Commands::ClaimWinnings { market_id } => {
@@ -178,10 +173,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let mut market_contract = MarketContractState::new(
                 market,
-                &cli.api_url,
                 auth_manager.clone(),
                 event_logger.clone(),
-            ).await?;
+                Default::default(),
+            );
 
             let winnings = market_contract.claim_winnings().await?;
             println!("Claimed {} USDC in winnings", winnings);

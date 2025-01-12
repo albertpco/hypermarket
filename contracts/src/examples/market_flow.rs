@@ -5,7 +5,7 @@ use crate::{
     events::EventLogger,
 };
 use ethers::types::{Address, U256};
-use hyperliquid_rust::types::order::Side;
+use hyperliquid_rust_sdk::types::Side;
 use std::sync::Arc;
 
 /// This example demonstrates a complete flow of:
@@ -26,7 +26,7 @@ async fn run_market_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a new market
     let market_id = factory.create_market(
-        "Will ETH be above $2000 on Dec 31, 2024?".to_string(),
+        "Will ETH be above $4000 on Dec 31, 2024?".to_string(),
         1735689600, // Dec 31, 2024
         Address::zero(), // Oracle address
         "USDC".to_string(),

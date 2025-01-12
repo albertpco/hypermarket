@@ -23,4 +23,81 @@ yarn-error.log*
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Build artifacts and test files
+**/target/
+**/debug/
+**/deps/
+**/.fingerprint/
+**/*.d
+**/*.rmeta
+**/*.rlib
+**/build/
+**/dist/
+coverage/
+.nyc_output/
+junit.xml
+test-results/
+cypress/videos/
+cypress/screenshots/
+
+# Cache directories
+.cache/
+.turbo/
+.next/
+.vercel/
+
+# Temporary files
+*.tmp
+*~
+*.bak
+*.log
+
+# Environment files
+.env*
+!.env.example
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+
+# Package manager files
+yarn.lock
+package-lock.json
+pnpm-lock.yaml
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# Rust specific
+**/*.rs.bk
+**/target/
+Cargo.lock 
+
+.cursorrules
+
+# Documentation and planning files
+finalplan.md
+followupplan.md
+proj.md
+projidea.md
+**/followupplan/
+**/planning/
+**/docs/internal/
+**/docs/private/
+**/*plan*.md
+**/*proj*.md
+**/temp_*.md
+**/draft_*.md
+**/wip_*.md
+
+# Keep public documentation
+!README.md
+!CONTRIBUTING.md
+!LICENSE.md
+!CHANGELOG.md

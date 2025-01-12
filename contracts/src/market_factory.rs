@@ -1,15 +1,15 @@
-use crate::{auth::{AuthManager, AuthError}, Market, MarketFactory, MarketStatus};
-use ethers::types::{Address, U256};
-use hyperliquid_rust::{
-    types::{Asset, AssetInfo, MarketMeta},
-    HyperliquidApi, HyperliquidError,
+use crate::{
+    auth::{AuthManager, AuthError},
+    events::{EventEmitter, MarketEvent},
+    hyperliquid_client::HyperliquidClient,
+    market::{Market, MarketStatus},
 };
+use async_trait::async_trait;
+use ethers::types::{Address, U256};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
-use async_trait::async_trait;
-use hyperliquid_rust::client::HyperliquidClient;
 
 #[derive(Error, Debug)]
 pub enum MarketFactoryError {
@@ -19,16 +19,49 @@ pub enum MarketFactoryError {
     InvalidOracle,
     #[error("Authentication error: {0}")]
     AuthError(#[from] AuthError),
-    #[error("Hyperliquid error: {0}")]
-    HyperliquidError(#[from] HyperliquidError),
+    #[error("API error: {0}")]
+    ApiError(String),
+    #[error("Unauthorized")]
+    Unauthorized,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MarketFactoryEvent {
+    MarketCreated {
+        market_id: String,
+        question: String,
+        expiry_timestamp: u64,
+        oracle_id: Address,
+        collateral_token: String,
+        creator: Address,
+    },
+    OracleAdded {
+        oracle_address: Address,
+        timestamp: u64,
+    },
+}
+
+#[async_trait]
+pub trait MarketFactory {
+    async fn create_market(
+        &mut self,
+        question: String,
+        expiry_timestamp: u64,
+        oracle_id: Address,
+        collateral_token: String,
+    ) -> Result<String, MarketFactoryError>;
+
+    fn get_market(&self, market_id: String) -> Option<Market>;
+    fn list_markets(&self) -> Vec<(String, Market)>;
+    async fn add_oracle(&mut self, oracle_address: Address) -> Result<(), MarketFactoryError>;
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MarketFactoryState {
     markets: HashMap<String, Market>,
     oracle_whitelist: Vec<Address>,
     next_market_id: u64,
-    api: HyperliquidApi,
     auth_manager: Arc<AuthManager>,
     event_emitter: Arc<dyn EventEmitter>,
     listing_fee: U256,
@@ -37,21 +70,17 @@ pub struct MarketFactoryState {
 
 impl MarketFactoryState {
     pub async fn new(
-        api_url: &str,
+        _api_url: &str,
         auth_manager: Arc<AuthManager>,
         event_emitter: Arc<dyn EventEmitter>,
         listing_fee: U256,
     ) -> Result<Self, MarketFactoryError> {
-        let api = HyperliquidApi::new(api_url)
-            .map_err(MarketFactoryError::HyperliquidError)?;
-
-        let client = HyperliquidClient::new(api.clone(), auth_manager.clone());
+        let client = HyperliquidClient::new(auth_manager.clone());
 
         Ok(Self {
             markets: HashMap::new(),
             oracle_whitelist: Vec::new(),
             next_market_id: 0,
-            api,
             auth_manager,
             event_emitter,
             listing_fee,
@@ -65,37 +94,12 @@ impl MarketFactoryState {
         format!("MARKET_{}", id)
     }
 
+    #[allow(dead_code)]
     fn generate_token_address(market_id: &str, is_yes: bool) -> String {
         let mut hasher = Keccak256::new();
         hasher.update(market_id.as_bytes());
-        hasher.update(if is_yes { b"YES" } else { b"NO" });
+        hasher.update(if is_yes { b"YES\0\0" } else { b"NO\0\0\0" });
         format!("0x{}", hex::encode(hasher.finalize()))
-    }
-
-    async fn create_market_pair(
-        &self,
-        market_id: &str,
-        collateral_token: &str,
-    ) -> Result<(String, String), MarketFactoryError> {
-        self.client
-            .create_market_pair(market_id, collateral_token)
-            .await
-            .map_err(MarketFactoryError::HyperliquidError)
-    }
-
-    async fn create_signed_request(&self, action: &str) -> Result<String, MarketFactoryError> {
-        let (message, signature) = self.auth_manager
-            .create_signed_request(action)
-            .await
-            .map_err(MarketFactoryError::AuthError)?;
-
-        let request = serde_json::json!({
-            "message": message,
-            "signature": signature,
-        });
-
-        Ok(serde_json::to_string(&request)
-            .map_err(|e| MarketFactoryError::HyperliquidError(HyperliquidError::SerializationError(e.to_string())))?)
     }
 
     async fn get_caller_address(&self) -> Result<Address, MarketFactoryError> {
@@ -126,44 +130,40 @@ impl MarketFactory for MarketFactoryState {
 
         let caller_address = self.get_caller_address().await?;
 
-        // Check if listing fee is sufficient
-        let listing_fee = self.listing_fee;
-        if listing_fee > U256::zero() {
-            // Transfer listing fee to contract owner
-            let admin_address = self.auth_manager.get_admin_address().map_err(MarketFactoryError::AuthError)?;
-            let signed_request = self.create_signed_request("transfer_listing_fee").await?;
-            self.client
-                .deposit_collateral(&format!("{:?}", collateral_token), listing_fee)
-                .await
-                .map_err(MarketFactoryError::HyperliquidError)?;
-        }
-
         // Generate market ID and create token markets
         let market_id = self.generate_market_id();
-        let (yes_token_address, no_token_address) = self.create_market_pair(&market_id, &format!("{:?}", collateral_token)).await?;
+        let (yes_token_address, no_token_address) = self.client
+            .create_market_pair(&market_id, &collateral_token)
+            .await
+            .map_err(|e| MarketFactoryError::ApiError(e))?;
 
         // Create market
         let market = Market {
-            question,
+            question: question.clone(),
             expiry_timestamp,
             oracle_id: format!("{:?}", oracle_id),
-            collateral_token: format!("{:?}", collateral_token), // Store as Address
+            collateral_token: format!("{:?}", collateral_token),
             status: MarketStatus::Active,
-            yes_token_address,
-            no_token_address,
+            yes_token_address: yes_token_address.clone(),
+            no_token_address: no_token_address.clone(),
             resolved_outcome: None,
         };
 
         self.markets.insert(market_id.clone(), market.clone());
 
         // Emit event
-        self.event_emitter.emit_market_factory_event(MarketFactoryEvent::MarketCreated {
+        self.event_emitter.emit_market_event(MarketEvent::MarketCreated {
             market_id: market_id.clone(),
-            question: market.question,
-            expiry_timestamp: market.expiry_timestamp,
-            oracle_id,
-            collateral_token,
             creator: caller_address,
+            question,
+            expiry_timestamp,
+            oracle_id,
+            yes_token: yes_token_address,
+            no_token: no_token_address,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         });
 
         Ok(market_id)
@@ -180,17 +180,17 @@ impl MarketFactory for MarketFactoryState {
             .collect()
     }
 
-    async fn add_oracle(&mut self, oracle_address: Address) -> Result<(), MarketFactoryError> {
+    async fn add_oracle(&mut self, oracle_id: Address) -> Result<(), MarketFactoryError> {
         let caller_address = self.get_caller_address().await?;
-        if caller_address != self.auth_manager.get_admin_address().map_err(MarketFactoryError::AuthError)? {
-            return Err(MarketFactoryError::AuthError(AuthError::Unauthorized));
+        if caller_address != self.auth_manager.get_current_address()? {
+            return Err(MarketFactoryError::Unauthorized);
         }
 
-        self.oracle_whitelist.push(oracle_address);
+        self.oracle_whitelist.push(oracle_id);
 
         // Emit event
-        self.event_emitter.emit_market_factory_event(MarketFactoryEvent::OracleAdded {
-            oracle_address,
+        self.event_emitter.emit_market_event(MarketEvent::OracleAdded {
+            oracle_id,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -204,6 +204,7 @@ impl MarketFactory for MarketFactoryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventLogger;
     use ethers::core::k256::ecdsa::SigningKey;
     use ethers::signers::LocalWallet;
 
@@ -224,10 +225,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Create event logger
+        let event_logger = Arc::new(EventLogger::new(true, false, None));
+
         let factory = MarketFactoryState::new(
             "http://localhost:8080",
             auth_manager,
-            Arc::new(EventEmitter::new()),
+            event_logger,
             U256::from(100),
         )
         .await
@@ -264,34 +268,27 @@ mod tests {
         // Verify market was created
         let market = factory.get_market(market_id).unwrap();
         assert_eq!(market.status, MarketStatus::Active);
-
-        // Verify listing fee was transferred
-        // This is a placeholder, in a real application, you would need to check the balance of the contract owner
-        // For now, we will just check that the function call did not return an error
     }
 
     #[tokio::test]
-    async fn test_create_market_insufficient_listing_fee() {
-        let (mut factory, wallet) = setup_test_factory().await;
+    async fn test_create_market_invalid_oracle() {
+        let (mut factory, _) = setup_test_factory().await;
         
-        // Add test oracle
-        factory.add_oracle(wallet.address()).await.unwrap();
-
-        // Test market creation with insufficient listing fee
+        // Test market creation with unregistered oracle
         let future_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 86400; // 1 day in future
+            .as_secs() + 86400;
 
         let result = factory
             .create_market(
                 "Will ETH price be above $2000 tomorrow?".to_string(),
                 future_timestamp,
-                wallet.address(),
+                Address::zero(),
                 "USDC".to_string(),
             )
             .await;
 
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(MarketFactoryError::InvalidOracle)));
     }
 } 

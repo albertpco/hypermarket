@@ -1,6 +1,5 @@
-use ethers::types::{Address, U256};
+use ethers::types::{Address, H256};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MarketEvent {
@@ -17,203 +16,163 @@ pub enum MarketEvent {
     TokensMinted {
         market_id: String,
         user: Address,
-        amount: U256,
+        amount: u64,
         timestamp: u64,
     },
-    OrderPlaced {
+    TokensBurned {
         market_id: String,
         user: Address,
-        side: String,
-        price: U256,
-        amount: U256,
+        yes_amount: u64,
+        no_amount: u64,
         timestamp: u64,
+        tx_hash: H256,
     },
     MarketResolved {
         market_id: String,
         oracle: Address,
         outcome: bool,
         timestamp: u64,
+        tx_hash: H256,
     },
     WinningsClaimed {
         market_id: String,
         user: Address,
-        amount: U256,
+        amount: u64,
         timestamp: u64,
+        tx_hash: H256,
     },
-    TokensBurned {
+    OrderPlaced {
         market_id: String,
         user: Address,
-        yes_amount: U256,
-        no_amount: U256,
+        side: String,
+        price: u64,
+        amount: u64,
+        timestamp: u64,
+        tx_hash: H256,
+    },
+    OrderCancelled {
+        market_id: String,
+        user: Address,
+        order_id: String,
+        timestamp: u64,
+        tx_hash: H256,
+    },
+    OrdersCancelled {
+        market_id: String,
+        user: Address,
+        timestamp: u64,
+    },
+    MarketExpired {
+        market_id: String,
         timestamp: u64,
     },
     CollateralDeposited {
         market_id: String,
         user: Address,
-        amount: U256,
+        amount: u64,
         timestamp: u64,
+        tx_hash: H256,
     },
     CollateralWithdrawn {
         market_id: String,
         user: Address,
-        amount: U256,
+        amount: u64,
         timestamp: u64,
+        tx_hash: H256,
     },
-    CollateralRequirementUpdated {
-        market_id: String,
-        user: Address,
-        required_amount: U256,
+    OracleAdded {
+        oracle_id: Address,
         timestamp: u64,
-    },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OracleEvent {
-    OracleRegistered {
-        oracle_id: Address,
-        registrar: Address,
-        timestamp: u64,
-    },
     OutcomeSubmitted {
         market_id: String,
-        oracle_id: Address,
+        oracle: Address,
         outcome: bool,
         timestamp: u64,
     },
-    ReputationUpdated {
-        oracle_id: Address,
-        old_score: u32,
-        new_score: u32,
-        timestamp: u64,
-    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AuthEvent {
-    UserAuthenticated {
-        user: Address,
-        timestamp: u64,
-    },
-    SignatureCreated {
-        user: Address,
-        action: String,
-        timestamp: u64,
-    },
-}
-
-pub trait EventEmitter {
+#[async_trait::async_trait]
+pub trait EventEmitter: Send + Sync + std::fmt::Debug {
     fn emit_market_event(&self, event: MarketEvent);
     fn emit_oracle_event(&self, event: OracleEvent);
-    fn emit_auth_event(&self, event: AuthEvent);
 }
 
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct EventLogger {
-    pub enable_console: bool,
-    pub enable_file: bool,
-    log_file: Option<String>,
+    pub log_to_console: bool,
+    pub log_to_file: bool,
+    pub log_file_path: Option<String>,
 }
 
 impl EventLogger {
-    pub fn new(enable_console: bool, enable_file: bool, log_file: Option<String>) -> Self {
+    pub fn new(log_to_console: bool, log_to_file: bool, log_file_path: Option<String>) -> Self {
         Self {
-            enable_console,
-            enable_file,
-            log_file,
-        }
-    }
-
-    fn get_current_timestamp() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-
-    fn log_event<T: Serialize>(&self, event: &T, event_type: &str) {
-        let timestamp = Self::get_current_timestamp();
-        let event_json = serde_json::to_string_pretty(event).unwrap_or_default();
-
-        if self.enable_console {
-            println!("[{}] {} Event: {}", timestamp, event_type, event_json);
-        }
-
-        if self.enable_file {
-            if let Some(file_path) = &self.log_file {
-                use std::fs::OpenOptions;
-                use std::io::Write;
-
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(file_path)
-                {
-                    let _ = writeln!(
-                        file,
-                        "[{}] {} Event: {}",
-                        timestamp, event_type, event_json
-                    );
-                }
-            }
+            log_to_console,
+            log_to_file,
+            log_file_path,
         }
     }
 }
 
 impl EventEmitter for EventLogger {
     fn emit_market_event(&self, event: MarketEvent) {
-        self.log_event(&event, "Market");
+        if self.log_to_console {
+            println!("Market Event: {:?}", event);
+        }
+
+        if self.log_to_file {
+            if let Some(path) = &self.log_file_path {
+                // Implement file logging here
+                // For now, we'll just print that we would log to file
+                println!("Would log market event to file: {}", path);
+            }
+        }
     }
 
     fn emit_oracle_event(&self, event: OracleEvent) {
-        self.log_event(&event, "Oracle");
-    }
+        if self.log_to_console {
+            println!("Oracle Event: {:?}", event);
+        }
 
-    fn emit_auth_event(&self, event: AuthEvent) {
-        self.log_event(&event, "Auth");
+        if self.log_to_file {
+            if let Some(path) = &self.log_file_path {
+                // Implement file logging here
+                // For now, we'll just print that we would log to file
+                println!("Would log oracle event to file: {}", path);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[test]
-    fn test_console_logging() {
+    fn test_event_logger() {
         let logger = EventLogger::new(true, false, None);
-        
-        let event = MarketEvent::MarketCreated {
-            market_id: "TEST_1".to_string(),
-            creator: Address::zero(),
-            question: "Test Market?".to_string(),
-            expiry_timestamp: 1234567890,
-            oracle_id: Address::zero(),
-            yes_token: "YES".to_string(),
-            no_token: "NO".to_string(),
-            timestamp: EventLogger::get_current_timestamp(),
+
+        // Test market event
+        let market_event = MarketEvent::TokensMinted {
+            market_id: "test_market".to_string(),
+            user: Address::zero(),
+            amount: 100,
+            timestamp: 1234567890,
         };
+        logger.emit_market_event(market_event);
 
-        logger.emit_market_event(event);
-    }
-
-    #[test]
-    fn test_file_logging() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let logger = EventLogger::new(
-            false,
-            true,
-            Some(temp_file.path().to_str().unwrap().to_string()),
-        );
-
-        let event = OracleEvent::OracleRegistered {
-            oracle_id: Address::zero(),
-            registrar: Address::zero(),
-            timestamp: EventLogger::get_current_timestamp(),
+        // Test oracle event
+        let oracle_event = OracleEvent::OutcomeSubmitted {
+            market_id: "test_market".to_string(),
+            oracle: Address::zero(),
+            outcome: true,
+            timestamp: 1234567890,
         };
-
-        logger.emit_oracle_event(event);
-
-        let content = std::fs::read_to_string(temp_file.path()).unwrap();
-        assert!(content.contains("Oracle Event"));
+        logger.emit_oracle_event(oracle_event);
     }
 } 

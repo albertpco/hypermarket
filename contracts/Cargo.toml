@@ -6,15 +6,22 @@ authors = ["HyperMarket Team"]
 description = "Smart contracts for the HyperMarket prediction market platform"
 
 [lib]
+name = "hypermarket"
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "hypermarket"
+path = "src/bin/hypermarket.rs"
 
 [dependencies]
 # Core dependencies
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+clap = { version = "4.4", features = ["derive", "env"] }
+dotenv = "0.15"
 
 # Hyperliquid SDK and related dependencies
-hyperliquid-rust = { git = "https://github.com/hyperliquid-dex/hyperliquid-rust.git", branch = "main" }
+hyperliquid_rust_sdk = { git = "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk.git", branch = "master" }
 ethers = { version = "2.0", features = ["ws", "rustls"] }
 reqwest = { version = "0.11", features = ["json"] }
 
@@ -32,6 +39,9 @@ async-trait = "0.1"
 # Logging and error handling
 log = "0.4"
 env_logger = "0.10"
+
+# Random number generation
+rand = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
